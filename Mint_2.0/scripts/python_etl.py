@@ -73,7 +73,7 @@ df = generateDf(chase,bofa)
 
 
 
-engine = sqlalchemy.create_engine('mysql+pymysql://root:Babusafti33@localhost/mint') # connect to server
+engine = sqlalchemy.create_engine('mysql+pymysql://root:<PASSWORD>@localhost/mint') # connect to server
 engine.execute("CREATE DATABASE IF NOT EXISTS mint") #create db
 engine.execute("USE mint") # select new db
 
@@ -120,7 +120,7 @@ DAG2 = [
        
 ]
 
-connection, cursor = get_cursor('Babusafti33')
+connection, cursor = get_cursor('<PASSWORD>')
 
 for sql_task in DDLS:
     execute_sql(sql_task, cursor)
