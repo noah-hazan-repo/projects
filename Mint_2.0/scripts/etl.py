@@ -1,7 +1,141 @@
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime, timedelta
+from sqlalchemy import create_engine
+from mysql.connector import Error
+from pprint import pprint
+import df2gspread as d2g
+import mysql.connector
+import pandas as pd
+import sqlalchemy
+import gspread
+import json
+import time
+import os
+import sys
 
-with categories as (
-select str_to_date(date, '%m/%d/%Y' ) as date, description,
-CASE WHEN DESCRIPTION LIKE '%QUADPAY%' THEN 'INCOME' 
+
+os.chdir('/Users/Noah.Hazan/Downloads/') # Change directory to location of all bank statements.
+
+
+
+def gatherStatements(): 
+    # Current support only for Chase and Bank of America statements.
+    chase = []
+    bofa = []
+    for file in os.listdir():
+        if 'chase' in file or 'Chase' in file:
+            chase.append(file)
+        elif 'stmt' in file:
+            bofa.append(file)
+    return chase, bofa
+
+def generateDf(chase, bofa): 
+    # Read statements and drop/rename columns to prepare for DataFrame union.
+    # Also insert 'dwh_insert_date' at position 0 for ETL purposes.
+    # Finally, deduplicate and remove nulls.
+    dfs = []
+    for path in bofa:
+        df = pd.read_csv(path, skiprows = 6)
+        df = df.drop(columns=['Running Bal.'])
+        dfs.append(df)
+    for path in chase:
+        df = pd.read_csv(path)
+        df = df.drop(columns=['Post Date', 'Category', 'Type', 'Memo'])
+        df = df.rename(columns={'Transaction Date' : 'Date'})
+        dfs.append(df)
+    df = pd.concat(dfs)
+    df = df.rename(columns={'Date':'date', 'Description':'description', 'Amount':'amount'})
+    df.insert(loc = 0,column = 'dwh_insert_date',value = str(datetime.now()))
+    df = df.drop_duplicates()
+    df = df.dropna()
+    return df
+
+def getConnection(password):
+    # Creates DB connection and generates cursor. 
+    # Must be run locally as DB is on my local machine.
+    connection = mysql.connector.connect(host='localhost',database='mint',user='root',password=password, autocommit=True)
+    return connection
+
+def executeSql(sql, cursor):
+    # Simply executes SQL and returns the cursor if wanted.
+    # Requires cursor input.
+    
+    try:
+        print("Executing SQL - {}: ".format(sql[:15]), end='') # Display header of SQL query for transparency.
+        cursor.execute(sql)
+    except mysql.connector.Error as err:
+        print(err.msg)
+    else:
+        print("OK")
+    return cursor
+
+def dfToSql(df,password,database,schema,target,ifexists='append'):
+    engine = sqlalchemy.create_engine(f'mysql+pymysql://root:{password}@localhost/{schema}') # connect to server
+    engine.execute(f'CREATE DATABASE IF NOT EXISTS {database}') #create db
+    engine.execute(f'USE {schema}') # select new db
+    df.to_sql(f'{target}', con = engine, if_exists=f'{ifexists}', index = False)
+    print('DataFrame -> SQL Database Complete')
+    
+    
+def transformLoadDf(sourceDf,transform_sql, targetTable):
+    conn = getConnection('Babusafti33')
+    cur = conn.cursor()
+    for sql_task in createTempTable:
+        executeSql(sql_task, cur)
+    dfToSql(sourceDf,'Babusafti33','mint','mint','tmp_transactions_raw','append')
+    for sql_task in insertTempToRaw:
+        executeSql(sql_task, cur)
+    seen_max_dwh_insert_date = executeSql("SELECT MAX(dwh_insert_date) FROM mint.f_transactions", cur)
+    seen_max_dwh_insert_date = seen_max_dwh_insert_date.fetchall()
+    transform_sql = transform_sql.format(seen_max_dwh_insert_date[0][0])
+    dfCategories = executeSql(transform_sql, cur)
+    unprocessed_records = dfCategories.fetchall()
+    dfCategories = pd.DataFrame(unprocessed_records,columns =['dwh_insert_date', 'date', 'description', 'category', 'amount'])
+    dfToSql(dfCategories, 'Babusafti33', 'mint', 'mint', f'{targetTable}', 'append')
+    conn.close()
+    
+    
+def mintTransactions():
+    conn = getConnection('Babusafti33')
+    cur = conn.cursor()
+    data = executeSql("SELECT * FROM mint.f_transactions", cur)
+    data = data.fetchall()
+    conn.close()
+    df = pd.DataFrame(data,columns =['dwh_insert_date', 'date', 'description', 'category', 'amount'])
+    df = df.drop_duplicates() # there should be none in theory, if we've done our work well
+    df = df.dropna() # there is one expected NULL in the 'amount' column which we initiated the table with
+    return df
+
+def dfToSheets(df):
+    # Hard coding the values for now.
+    os.chdir('/Users/Noah.Hazan/Downloads/')
+    scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/spreadsheets',"https://www.googleapis.com/auth/drive.file","https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    gc = gspread.authorize(creds)
+    worksheet = gc.open('MINT_2.0').worksheet('Sheet1')
+    df['dwh_insert_date']=df['dwh_insert_date'].astype(str)
+    worksheet.update('A1',[df.columns.values.tolist()] + df.values.tolist())
+
+createTempTable = [ "USE mint;", 
+       
+       "CREATE TABLE IF NOT EXISTS tmp_transactions_raw AS SELECT * FROM mint.f_transactions_raw;"
+      ]
+
+insertTempToRaw = [ "USE mint;",
+        
+        """INSERT INTO mint.f_transactions_raw SELECT tmp_transactions_raw.*
+        FROM   tmp_transactions_raw
+        LEFT   JOIN f_transactions_raw USING ( date, description, amount)
+        WHERE  f_transactions_raw.date IS NULL; """,
+
+        "DROP TABLE tmp_transactions_raw;"
+       ]
+
+generateCategories = """SELECT 
+                        dwh_insert_date as dwh_insert_date, 
+                         cast(date as char(100)) as date,
+                        description,
+                        CASE WHEN DESCRIPTION LIKE '%QUADPAY%' THEN 'INCOME' 
                             WHEN DESCRIPTION LIKE '%SAINT PETERS%' THEN 'INCOME'
                             WHEN DESCRIPTION LIKE '%RAINBOW CLEANERS%' THEN 'CLEANERS'
                             WHEN DESCRIPTION LIKE '%COFFEE%' THEN 'COFFEE'
@@ -198,8 +332,54 @@ CASE WHEN DESCRIPTION LIKE '%QUADPAY%' THEN 'INCOME'
                             ELSE 'UNCLASSIFIED'
                         END AS category,
                         amount 
- from mint.f_transactions_raw 
- )
- select year(date), month(date), category, sum(amount) as amount_sum 
- from categories where category <> 'TRANSFER_TO_EXTERNAL_ACCOUNT' group by 1,2,3 order by 1, 2 
- 
+                    FROM 
+                        mint.f_transactions_raw 
+                    WHERE 
+                        dwh_insert_date > '{}'"""
+
+
+# STEP 1: 
+
+# If first run, or developer wishes to start from scratch, run ddls_and_dmls.sql
+
+# DROP TABLE IF EXISTS mint.f_transactions_raw;
+# DROP TABLE IF EXISTS mint.f_transactions;
+# DROP TABLE IF EXISTS mint.tmp_transactions_raw;
+# DROP TABLE IF EXISTS mint.job_logging;
+# 
+# 
+# CREATE TABLE IF NOT EXISTS mint.f_transactions_raw (
+#     dwh_insert_date TIMESTAMP NOT NULL,
+#     date VARCHAR(1000) NOT NULL,
+#     description VARCHAR(512),
+#     amount VARCHAR(1000)
+# );
+#         
+# CREATE TABLE IF NOT EXISTS mint.f_transactions (
+#     dwh_insert_date VARCHAR(100) NOT NULL,
+#     date VARCHAR(1000) NOT NULL,
+#     description VARCHAR(512),
+#     category VARCHAR(100),
+#     amount VARCHAR(1000)
+# );
+#         
+# CREATE TABLE IF NOT EXISTS mint.job_logging (
+#     job_dwh_insert_date TIMESTAMP NOT NULL
+# );
+# 
+# INSERT INTO mint.f_transactions (dwh_insert_date, date, description, category, amount)
+# VALUES ('1970-01-01 00:00:00.000000', '1970-01-01', NULL,NULL, NULL);
+
+# STEP 2:
+
+# Gather downloaded statements and generate unioned DataFrame.
+
+chase,bofa = gatherStatements()
+
+df = generateDf(chase,bofa)
+
+transformLoadDf(df, generateCategories, 'f_transactions')
+
+dataDf = mintTransactions()
+
+dfToSheets(dataDf)
