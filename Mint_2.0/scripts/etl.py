@@ -8,41 +8,51 @@ import mysql.connector
 import pandas as pd
 import sqlalchemy
 import gspread
-import json
 import time
-import os
+import json
 import sys
-
-
+import os
 os.chdir('/Users/Noah.Hazan/Downloads/') # Change directory to location of all bank statements.
 
-
-
-def gatherStatements(): 
-    # Current support only for Chase and Bank of America statements.
-    chase = []
-    bofa = []
+def chaseDf():
+    paths_to_chase_files = []
+    chase_dfs = []
     for file in os.listdir():
         if 'chase' in file or 'Chase' in file:
-            chase.append(file)
-        elif 'stmt' in file:
-            bofa.append(file)
-    return chase, bofa
+            paths_to_chase_files.append(file)
+    for path in paths_to_chase_files:
+        df = pd.read_csv(path)
+        
+        if 'Details' in df.columns:
+            df = df.drop(columns=['Details', 'Type', 'Balance', 'Check or Slip #'])
+            df.rename(columns={'Posting Date':'Date'})
+        else:    
+            df = df.drop(columns=['Post Date', 'Category', 'Type', 'Memo'])
+            df = df.rename(columns={'Transaction Date' : 'Date'})
+        chase_dfs.append(df)
+    df = pd.concat(chase_dfs)
+    return df
+    
+def bofaDf():
+    paths_to_bofa_files = []
+    bofa_dfs = []
+    for file in os.listdir():
+        if 'stmt' in file:
+            paths_to_bofa_files.append(file)
+    for path in paths_to_bofa_files:
+        df = pd.read_csv(path, skiprows = 6)
+        df = df.drop(columns=['Running Bal.'])
+        bofa_dfs.append(df)
+    df = pd.concat(bofa_dfs)
+    return df
 
-def generateDf(chase, bofa): 
+def banksDf(): 
     # Read statements and drop/rename columns to prepare for DataFrame union.
     # Also insert 'dwh_insert_date' at position 0 for ETL purposes.
     # Finally, deduplicate and remove nulls.
-    dfs = []
-    for path in bofa:
-        df = pd.read_csv(path, skiprows = 6)
-        df = df.drop(columns=['Running Bal.'])
-        dfs.append(df)
-    for path in chase:
-        df = pd.read_csv(path)
-        df = df.drop(columns=['Post Date', 'Category', 'Type', 'Memo'])
-        df = df.rename(columns={'Transaction Date' : 'Date'})
-        dfs.append(df)
+    chase_df = chaseDf()
+    bofa_df = bofaDf()
+    dfs = [chase_df, bofa_df]
     df = pd.concat(dfs)
     df = df.rename(columns={'Date':'date', 'Description':'description', 'Amount':'amount'})
     df.insert(loc = 0,column = 'dwh_insert_date',value = str(datetime.now()))
@@ -77,25 +87,33 @@ def dfToSql(df,password,database,schema,target,ifexists='append'):
     print('DataFrame -> SQL Database Complete')
     
     
-def transformLoadDf(sourceDf,transform_sql, targetTable):
+def incrementalLoad(sourceDf,transform_sql, targetTable):
     conn = getConnection('Babusafti33')
     cur = conn.cursor()
-    for sql_task in createTempTable:
+    print("creating temp table if not exists")
+    for sql_task in create_temp_table:
         executeSql(sql_task, cur)
+    print("appending sourceDf input to temp table")
     dfToSql(sourceDf,'Babusafti33','mint','mint','tmp_transactions_raw','append')
-    for sql_task in insertTempToRaw:
+    print("upserting tmp table using dedup logic to production table")
+    for sql_task in upsert_from_temp:
         executeSql(sql_task, cur)
     seen_max_dwh_insert_date = executeSql("SELECT MAX(dwh_insert_date) FROM mint.f_transactions", cur)
     seen_max_dwh_insert_date = seen_max_dwh_insert_date.fetchall()
+    print(f"grabbed the most recent insert date which was {seen_max_dwh_insert_date[0][0]}")
     transform_sql = transform_sql.format(seen_max_dwh_insert_date[0][0])
+    print("formatted the transform_sql to include this date")
+    print("now appling logic to transform the sql")
     dfCategories = executeSql(transform_sql, cur)
     unprocessed_records = dfCategories.fetchall()
+    print("grabbed all unprocessed records using the date above as inference")
     dfCategories = pd.DataFrame(unprocessed_records,columns =['dwh_insert_date', 'date', 'description', 'category', 'amount'])
+    print("appended new data to the production table")
     dfToSql(dfCategories, 'Babusafti33', 'mint', 'mint', f'{targetTable}', 'append')
     conn.close()
     
     
-def mintTransactions():
+def retrieveProductionData():
     conn = getConnection('Babusafti33')
     cur = conn.cursor()
     data = executeSql("SELECT * FROM mint.f_transactions", cur)
@@ -116,12 +134,12 @@ def dfToSheets(df):
     df['dwh_insert_date']=df['dwh_insert_date'].astype(str)
     worksheet.update('A1',[df.columns.values.tolist()] + df.values.tolist())
 
-createTempTable = [ "USE mint;", 
+create_temp_table = [ "USE mint;", 
        
        "CREATE TABLE IF NOT EXISTS tmp_transactions_raw AS SELECT * FROM mint.f_transactions_raw;"
       ]
 
-insertTempToRaw = [ "USE mint;",
+upsert_from_temp = [ "USE mint;",
         
         """INSERT INTO mint.f_transactions_raw SELECT tmp_transactions_raw.*
         FROM   tmp_transactions_raw
@@ -131,61 +149,64 @@ insertTempToRaw = [ "USE mint;",
         "DROP TABLE tmp_transactions_raw;"
        ]
 
-generateCategories = """SELECT 
+transform_query = """SELECT 
                         dwh_insert_date as dwh_insert_date, 
                          cast(date as char(100)) as date,
                         description,
-                        CASE WHEN DESCRIPTION LIKE '%QUADPAY%' THEN 'INCOME' 
+                        CASE 
+                            WHEN DESCRIPTION LIKE '%TICKPICK%' THEN 'WIFE'
+                            WHEN DESCRIPTION LIKE '%STUDENT LN%' THEN 'CHARITY'
+                            WHEN DESCRIPTION LIKE '%QUADPAY%' THEN 'INCOME' 
                             WHEN DESCRIPTION LIKE '%SAINT PETERS%' THEN 'INCOME'
                             WHEN DESCRIPTION LIKE '%RAINBOW CLEANERS%' THEN 'CLEANERS'
                             WHEN DESCRIPTION LIKE '%COFFEE%' THEN 'COFFEE'
                             WHEN DESCRIPTION LIKE '%RITE AID%' THEN 'CONVENIENCE STORE'
                             WHEN DESCRIPTION LIKE '%CHINA%' THEN 'RESTAURANT'
-                            WHEN DESCRIPTION LIKE '%GOLDMAN SACHS%' THEN 'TRANSFER_TO_EXTERNAL_ACCOUNT'
+                            WHEN DESCRIPTION LIKE '%GOLDMAN SACHS%' THEN 'TRANSFER'
                             WHEN DESCRIPTION LIKE '%PAYMENT%' THEN 'BILL PAYMENT'
                             WHEN DESCRIPTION LIKE '%PAYROLL%' THEN 'INCOME'
-                            WHEN DESCRIPTION LIKE '%HONDA%' THEN 'BILL PAYMENT'
+                            WHEN DESCRIPTION LIKE '%HONDA%' THEN 'CAR'
                             WHEN DESCRIPTION LIKE '%YAD ELIEZER%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%LOIS E. SHULM%' THEN 'HEALTH'
                             WHEN DESCRIPTION LIKE '%TARGET%' THEN 'TARGET'
                             WHEN DESCRIPTION LIKE '%TOMCHEI%' THEN 'CHARITY'
-                            WHEN DESCRIPTION LIKE '%OIL%' THEN 'CAR'
+                            WHEN DESCRIPTION LIKE '%LUKOIL%' THEN 'CAR'
                             WHEN DESCRIPTION LIKE '%SUNOCO%' THEN 'CAR'
                             WHEN DESCRIPTION LIKE '%DUNKIN%' THEN 'COFFEE'
                             WHEN DESCRIPTION LIKE '%STARBUCKS%' THEN 'COFFEE'
                             WHEN DESCRIPTION LIKE '%SHEETZ%' THEN 'CAR'
-                            WHEN DESCRIPTION LIKE '%STOP & SHOP%' THEN 'GROCERIES'
-                            WHEN DESCRIPTION LIKE '%INSTACART%' THEN 'GROCERIES'
+                            WHEN DESCRIPTION LIKE '%STOP & SHOP%' THEN 'GROCERIES AND BABY'
+                            WHEN DESCRIPTION LIKE '%INSTACART%' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%SUNOCO%' THEN 'GAS'
-                            WHEN DESCRIPTION LIKE '%PSEG%' THEN 'BILL PAYMENT'
+                            WHEN DESCRIPTION LIKE '%PSEG%' THEN 'HOUSE'
                             WHEN DESCRIPTION LIKE '%PIZZA%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%SUSHI%' THEN 'RESTAURANT'
-                            WHEN DESCRIPTION LIKE '%VERIZON%' THEN 'BILL PAYMENT'
-                            WHEN DESCRIPTION LIKE '%OPTIMUM%' THEN 'BILL PAYMENT'
+                            WHEN DESCRIPTION LIKE '%VERIZON%' THEN 'HOUSE'
+                            WHEN DESCRIPTION LIKE '%OPTIMUM%' THEN 'HOUSE'
                             WHEN DESCRIPTION LIKE '%DEPT EDUCATION%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%ONLINE PMT%' THEN 'BILL PAYMENT'
                             WHEN DESCRIPTION LIKE '%Amazon%' THEN 'AMAZON'
                             WHEN DESCRIPTION LIKE '%CHASE CREDIT%' THEN 'BILL PAYMENT'
-                            WHEN DESCRIPTION LIKE '%Trnsfr%' THEN 'TRANSFER_TO_EXTERNAL_ACCOUNT'
+                            WHEN DESCRIPTION LIKE '%Trnsfr%' THEN 'TRANSFER'
                             WHEN DESCRIPTION LIKE '%FLORA%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%Bill Pay%' THEN 'BILL PAYMENT'
                             WHEN DESCRIPTION LIKE '%Check%' THEN 'MISC'
-                            WHEN DESCRIPTION LIKE '%transfer%' THEN 'TRANSFER_TO_EXTERNAL_ACCOUNT'
+                            WHEN DESCRIPTION LIKE '%transfer%' THEN 'TRANSFER'
                             WHEN DESCRIPTION LIKE '%BLUESTONE%' THEN 'COFFEE'
                             WHEN DESCRIPTION LIKE '%RWJ NEW%' THEN 'HEALTH'
-                            WHEN DESCRIPTION LIKE '%SPOTIFY%' THEN 'BILL PAYMENT'
-                            WHEN DESCRIPTION LIKE '%APPLE%' THEN 'BILL PAYMENT'
+                            WHEN DESCRIPTION LIKE '%SPOTIFY%' THEN 'GENERAL'
+                            WHEN DESCRIPTION LIKE '%APPLE%' THEN 'GENERAL'
                             WHEN DESCRIPTION LIKE '%ATM%' THEN 'MISC'
-                            WHEN DESCRIPTION LIKE '%Marcus Invest%' THEN 'TRANSFER_TO_EXTERNAL_ACCOUNT'
+                            WHEN DESCRIPTION LIKE '%Marcus Invest%' THEN 'TRANSFER'
                             WHEN DESCRIPTION LIKE '%DISNEY%' THEN 'INCOME'
                             WHEN DESCRIPTION LIKE '%MTA%' THEN 'TRAVEL'
-                            WHEN DESCRIPTION LIKE '%WELLS FARGO%' THEN 'BILL PAYMENT'
+                            WHEN DESCRIPTION LIKE '%WELLS FARGO%' THEN 'HOUSE'
                             WHEN DESCRIPTION LIKE '%AMZN%' THEN 'AMAZON'
                             WHEN DESCRIPTION LIKE '%BAKERY%' THEN 'RESTAURANT'
-                            WHEN DESCRIPTION LIKE '%WHOLEFDS%' THEN 'GROCERIES'
+                            WHEN DESCRIPTION LIKE '%WHOLEFDS%' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%TRANSACTION FEE%' THEN 'MISC'
                             WHEN DESCRIPTION LIKE '%MINI GOLF%' THEN 'WIFE'
-                            WHEN DESCRIPTION LIKE '%NINTENDO%' THEN 'PERSONAL'
+                            WHEN DESCRIPTION LIKE '%NINTENDO%' THEN 'GENERAL'
                             WHEN DESCRIPTION LIKE '%BRIDGE TURKISH%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%LYFT%' THEN 'TRAVEL'
                             WHEN DESCRIPTION LIKE '%UBER%' THEN 'TRAVEL'
@@ -213,7 +234,7 @@ generateCategories = """SELECT
                             WHEN DESCRIPTION LIKE '%NAILS%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%GIVING%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%AIRBNB%' THEN 'TRAVEL'
-                            WHEN DESCRIPTION LIKE '%STOP &%' THEN 'GROCERIES'
+                            WHEN DESCRIPTION LIKE '%STOP &%' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%BUDGET.COM%' THEN 'TRAVEL'
                             WHEN DESCRIPTION LIKE '%SPIRIT%' THEN 'TRAVEL'
                             WHEN DESCRIPTION LIKE '%CLEANERS%' THEN 'CLEANERS'
@@ -222,18 +243,18 @@ generateCategories = """SELECT
                             WHEN DESCRIPTION LIKE '%VENDING%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%CONG.%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%7-ELEVEN%' THEN 'CAR'
-                            WHEN DESCRIPTION LIKE '%GLATT 27%' THEN 'GROCERIES'
-                            WHEN DESCRIPTION LIKE '%BEXLEY MKT%' THEN 'GROCERIES'
-                            WHEN DESCRIPTION LIKE '%TRADER JOE%' THEN 'GROCERIES'
+                            WHEN DESCRIPTION LIKE '%GLATT 27%' THEN 'GROCERIES AND BABY'
+                            WHEN DESCRIPTION LIKE '%BEXLEY MKT%' THEN 'GROCERIES AND BABY'
+                            WHEN DESCRIPTION LIKE '%TRADER JOE%' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%HEADWAY%' THEN 'HEALTH'
                             WHEN DESCRIPTION LIKE '%EXXON%' THEN 'CAR'
                             WHEN DESCRIPTION LIKE '%CHAI%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%BUY BUY%' THEN 'GENERAL'
                             WHEN DESCRIPTION LIKE '%HYATT%' THEN 'TRAVEL'
-                            WHEN DESCRIPTION LIKE '%KOSHER%' THEN 'GROCERIES'
+                            WHEN DESCRIPTION LIKE '%KOSHER%' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%HAVA JAVA%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%KOHL%' THEN 'WIFE'
-                            WHEN DESCRIPTION LIKE '%SHOPRITE%' THEN 'GROCERIES'
+                            WHEN DESCRIPTION LIKE '%SHOPRITE%' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%OLD NAVY%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%AMC%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%SPEEDWAY%' THEN 'CAR'
@@ -242,12 +263,12 @@ generateCategories = """SELECT
                             WHEN DESCRIPTION LIKE '%CABOKI%' THEN 'HEALTH'
                             WHEN DESCRIPTION LIKE '%RITA%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%ROASTERY%' THEN 'COFFEE'
-                            WHEN DESCRIPTION LIKE '%KROGER%' THEN 'GROCERIES'
+                            WHEN DESCRIPTION LIKE '%KROGER%' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%FINES AND COSTS%' THEN 'MISC'
-                            WHEN DESCRIPTION LIKE '%MUSIC%' THEN 'PERSONAL'
+                            WHEN DESCRIPTION LIKE '%MUSIC%' THEN 'GENERAL'
                             WHEN DESCRIPTION LIKE '%KITTIE%' THEN 'COFFEE'
                             WHEN DESCRIPTION LIKE '%CHASDEI%' THEN 'CHARITY'
-                            WHEN DESCRIPTION LIKE '%BESTBUY%' THEN 'PERSONAL'
+                            WHEN DESCRIPTION LIKE '%BESTBUY%' THEN 'GENERAL'
                             WHEN DESCRIPTION LIKE '%CHICKIES%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%SPA%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%PRIME%' THEN 'AMAZON'
@@ -259,19 +280,22 @@ generateCategories = """SELECT
                             WHEN DESCRIPTION LIKE '%SKI%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%QUICK CHEK%' THEN 'COFFEE'
                             WHEN DESCRIPTION LIKE '%THEATRE%' THEN 'WIFE'
+                            WHEN DESCRIPTION LIKE '%DONATI%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%FIRESIDE%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%PARKING%' THEN 'MISC'
-                            WHEN DESCRIPTION LIKE '%YOLANDA%' THEN 'MISC'
+                            WHEN DESCRIPTION LIKE '%YOLANDA%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%TJMA%' THEN 'WIFE'
-                            WHEN DESCRIPTION LIKE '%KISSENA%' THEN 'GROCERIES'
+                            WHEN DESCRIPTION LIKE '%KISSENA%' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%PARTY%' THEN 'MISC'
                             WHEN DESCRIPTION LIKE '%STAPLES%' THEN 'GENERAL'
                             WHEN DESCRIPTION LIKE '%YERUSHALAYIM%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%LAWRENCE%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%LOFT%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%ANTHRO%' THEN 'WIFE'
+                            WHEN DESCRIPTION LIKE '%GIVING%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%Travel%' THEN 'TRAVEL'
                             WHEN DESCRIPTION LIKE '%VICTORIA%' THEN 'WIFE'
+                            WHEN DESCRIPTION LIKE '%PARKING%' THEN 'CAR'
                             WHEN DESCRIPTION LIKE '%TAXI%' THEN 'TRAVEL'
                             WHEN DESCRIPTION LIKE '%TAVLIN%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%GIVING%' THEN 'CHARITY'
@@ -295,7 +319,7 @@ generateCategories = """SELECT
                             WHEN DESCRIPTION LIKE '%RWJ%' THEN 'HEALTH'
                             WHEN DESCRIPTION LIKE '%Duane%' THEN 'CONVENIENCE STORE'
                             WHEN DESCRIPTION LIKE '%TAXRFD%' THEN 'INCOME'
-                            WHEN DESCRIPTION LIKE '%MUNICI%' THEN 'BILL PAYMENT'
+                            WHEN DESCRIPTION LIKE '%MUNICI%' THEN 'MISC'
                             WHEN DESCRIPTION LIKE '%MEOROT%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%BBQ%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%BAKERIST%' THEN 'RESTAURANT'
@@ -303,7 +327,7 @@ generateCategories = """SELECT
                             WHEN DESCRIPTION LIKE '%656 OCEAN%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%HILTON%' THEN 'TRAVEL'
                             WHEN DESCRIPTION LIKE '%REWARD%' THEN 'INCOME'
-                            WHEN DESCRIPTION LIKE '%ROBINHOOD%' AND AMOUNT < 0  THEN 'TRANSFER_TO_EXTERNAL_ACCOUNT'
+                            WHEN DESCRIPTION LIKE '%ROBINHOOD%' THEN 'TRANSFER'
                             WHEN DESCRIPTION LIKE '%VENMO%' THEN 'MISC'
                             WHEN DESCRIPTION LIKE '%NATIONWIDE%' THEN 'HEALTH'
                             WHEN DESCRIPTION LIKE '%GRAETERS%' THEN 'RESTAURANT'
@@ -319,7 +343,7 @@ generateCategories = """SELECT
                             WHEN DESCRIPTION LIKE '%ROAD RUNNER%' THEN 'HEALTH'
                             WHEN DESCRIPTION LIKE '%KITCHEN%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%PIZZ%' THEN 'RESTAURANT'
-                            WHEN DESCRIPTION LIKE '%WEGMAN%' THEN 'GROCERIES'
+                            WHEN DESCRIPTION LIKE '%WEGMAN%' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%AIRPORT%' THEN 'TRAVEL'
                             WHEN DESCRIPTION LIKE '%BLOOMINGDAL%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%FEE%' THEN 'MISC'
@@ -329,6 +353,11 @@ generateCategories = """SELECT
                             WHEN DESCRIPTION LIKE '%WOMENS%' THEN 'WIFE'
                             WHEN DESCRIPTION LIKE '%GRILL%' THEN 'RESTAURANT'
                             WHEN DESCRIPTION LIKE '%MACY%' THEN 'WIFE'
+                            WHEN DESCRIPTION LIKE '%YU.EDU' THEN 'CHARITY'
+                            WHEN DESCRIPTION LIKE '%BRAVO%' THEN 'GROCERIES AND BABY'
+                            WHEN DESCRIPTION LIKE '%BRACHA' THEN 'CHARITY'
+                            WHEN DESCRIPTION LIKE '%SURGERY%' THEN 'HEALTH'
+                            
                             ELSE 'UNCLASSIFIED'
                         END AS category,
                         amount 
@@ -374,12 +403,9 @@ generateCategories = """SELECT
 
 # Gather downloaded statements and generate unioned DataFrame.
 
-chase,bofa = gatherStatements()
 
-df = generateDf(chase,bofa)
 
-transformLoadDf(df, generateCategories, 'f_transactions')
-
-dataDf = mintTransactions()
-
-dfToSheets(dataDf)
+df = banksDf()
+incrementalLoad(df, transform_query, 'f_transactions')
+data = retrieveProductionData()
+dfToSheets(data)
