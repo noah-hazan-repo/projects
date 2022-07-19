@@ -57,6 +57,8 @@ def getBirthdays(username, password):
 
 
 def birthdayBot(names,birthdays):
+    
+    assert len(names) == len(birthdays)
 
     for i in range(len(birthdays)):
 
