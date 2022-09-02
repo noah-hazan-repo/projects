@@ -25,8 +25,8 @@ def chaseDf():
             df = df.drop(columns=['Details', 'Type', 'Balance', 'Check or Slip #'])
             df.rename(columns={'Posting Date':'Date'})
         else:    
-            df = df.drop(columns=['Post Date', 'Category', 'Type', 'Memo'])
-            df = df.rename(columns={'Transaction Date' : 'Date'})
+            df = df.drop(columns=['Post Date', 'Type', 'Memo'])
+            df = df.rename(columns={'Transaction Date' : 'Date', 'Category':'bank_category'})
         chase_dfs.append(df)
     df = pd.concat(chase_dfs)
     return df
@@ -40,8 +40,9 @@ def bofaDf():
     for path in paths_to_bofa_files:
         df = pd.read_csv(path, skiprows = 6)
         df = df.drop(columns=['Running Bal.'])
-        bofa_dfs.append(df)
+        bofa_dfs.append(df)  
     df = pd.concat(bofa_dfs)
+    df.insert(loc = 2,column = 'bank_category',value = 'None')
     return df
 
 def banksDf(): 
@@ -52,10 +53,11 @@ def banksDf():
     bofa_df = bofaDf()
     dfs = [chase_df, bofa_df]
     df = pd.concat(dfs)
-    df = df.rename(columns={'Date':'date', 'Description':'description', 'Amount':'amount'})
+    df = df.rename(columns={'Date':'date', 'Description':'description', 'Category':'bank_category', 'Amount':'amount'})
     df.insert(loc = 0,column = 'dwh_insert_date',value = str(datetime.now()))
     df = df.drop_duplicates()
     df = df.dropna()
+    df['amount'] = df['amount'].astype('str').str.replace(',','').astype('float')
     return df
 
 
@@ -70,6 +72,7 @@ def dfToSheets(df):
     gc = gspread.authorize(creds)
     worksheet = gc.open('MINT_2.0').worksheet('Sheet1')
     df['dwh_insert_date']=df['dwh_insert_date'].astype(str)
+    worksheet.clear()
     worksheet.update('A1',[df.columns.values.tolist()] + df.values.tolist())
 
 
@@ -83,14 +86,15 @@ SELECT
                         dwh_insert_date as dwh_insert_date, 
                          cast(date as char(100)) as date,
                         description,
+                        cast(amount as float) as amount,
                         CASE 
-                           WHEN AMOUNT > 0 AND (DESCRIPTION NOT LIKE '%GOLDMAN SACHS%' 
-                           and DESCRIPTION NOT LIKE '%PAYMENT%' and DESCRIPTION NOT LIKE '%TRANSFER%') THEN 'INCOME'
-                                                  
+                           WHEN amount > 0 AND (DESCRIPTION NOT LIKE '%GOLDMAN SACHS%' 
+                           and DESCRIPTION NOT LIKE '%PAYMENT%' and DESCRIPTION NOT LIKE '%TRANSFER%') THEN 'INCOME' 
+                          WHEN bank_category = 'Groceries' THEN 'GROCERIES AND BABY'
                             WHEN DESCRIPTION LIKE '%TICKPICK%' THEN 'WANTS'
+                            WHEN DESCRIPTION LIKE '%SBUFEESDEPOSIT%' THEN 'CHARITY'
                             WHEN DESCRIPTION LIKE '%STUDENT LN%' THEN 'CHARITY'
-                            
-                            
+                            WHEN DESCRIPTION LIKE '%SOHO NAILS%' THEN 'WANTS'
                             WHEN DESCRIPTION LIKE '%RAINBOW CLEANERS%' THEN 'HOUSE BILLS'
                             WHEN DESCRIPTION LIKE '%COFFEE%' THEN 'RESTAURANT/COFFEE'
                             WHEN DESCRIPTION LIKE '%RITE AID%' THEN 'GENERAL NEEDS (TARGET, AMAZON, RITE AID, ETC)'
@@ -330,10 +334,51 @@ SELECT
                          WHEN DESCRIPTION LIKE '%JJS%' THEN 'WANTS'
                          WHEN DESCRIPTION LIKE '%BANANARE' THEN 'WANTS'
                          WHEN DESCRIPTION LIKE '%BAGEL%' THEN 'RESTAURANT/COFFEE'
-                            
+                         WHEN DESCRIPTION LIKE '%BRUCE SPRINGSTEEN%' THEN 'WANTS'
+                         WHEN DESCRIPTION LIKE '%MENUCHA%' THEN 'CHARITY'
+                         WHEN DESCRIPTION LIKE '%KOSH%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%TOPGOLF%' THEN 'WANTS'
+                         WHEN DESCRIPTION LIKE '%BARBER SHOP%' THEN 'MEDICAL AND GYM'
+                         WHEN DESCRIPTION LIKE '%VANGUARD%' THEN 'MISC'
+                         WHEN DESCRIPTION LIKE '%DOLLAR CITY%' THEN 'GENERAL NEEDS (TARGET, AMAZON, RITE AID, ETC)'
+                         WHEN DESCRIPTION LIKE '%IPA MAN%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%CAFFE YAHUDA HALEVI%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%GIFTS%' THEN 'WANTS'
+                         WHEN DESCRIPTION LIKE '%AROMA%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%ZOL GADOL%' THEN 'GENERAL NEEDS (TARGET, AMAZON, RITE AID, ETC)'
+                         WHEN DESCRIPTION LIKE '%TMOL%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%GAN SIPOR SAKER%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%BEGAL CAFE REHAVIA%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%COFFE%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%KAFE RIMON%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%SUPER PHARM%' THEN 'GENERAL NEEDS (TARGET, AMAZON, RITE AID, ETC)'
+                         WHEN DESCRIPTION LIKE '%SHORASHIM%' THEN 'GENERAL NEEDS (TARGET, AMAZON, RITE AID, ETC)'
+                         WHEN DESCRIPTION LIKE '%GRAFUS BEAM%' THEN 'GENERAL NEEDS (TARGET, AMAZON, RITE AID, ETC)'
+                         WHEN DESCRIPTION LIKE '%AMI%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%L LEVY NADLAN%' THEN 'GENERAL NEEDS (TARGET, AMAZON, RITE AID, ETC)'
+                         WHEN DESCRIPTION LIKE '%HOTEL%' THEN 'TRAVEL'
+                         WHEN DESCRIPTION LIKE '%INFUSED JLM%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%HEADWAY%' THEN 'MEDICAL AND GYM'
+                         
+                         WHEN DESCRIPTION LIKE '%FACEBK%' THEN 'MISC'
+                         WHEN DESCRIPTION LIKE '%PURCHASE NEW BRUNSWICK NJ%' THEN 'RESTAURANT/COFFEE'
+                         WHEN DESCRIPTION LIKE '%ZARA USA%' THEN 'GENERAL NEEDS (TARGET, AMAZON, RITE AID, ETC)'
+                         WHEN DESCRIPTION LIKE '%TOP GOLF%' THEN 'WANTS'
+                         WHEN DESCRIPTION LIKE '%AMERICAN FRIENDS OF%' THEN 'CHARITY'
+                         
+                         WHEN DESCRIPTION LIKE '%CHAILI%' THEN 'CHARITY'
+                         WHEN DESCRIPTION LIKE '%TORAHT%' THEN 'CHARITY'
+                         WHEN DESCRIPTION LIKE '%GIVING%' THEN 'CHARITY'
+                         WHEN DESCRIPTION LIKE '%MR. C%' THEN 'TRAVEL'
+                         WHEN DESCRIPTION LIKE '%AIRPOR%' THEN 'TRAVEL'
+                         
+                         
+                         
+                         
+                         
+                         
                             ELSE 'UNCLASSIFIED'
-                        END AS category,
-                        amount 
+                        END AS category
                     FROM 
                         df) select *, 
                         
@@ -372,14 +417,6 @@ SELECT
                          END as needs_vs_wants
                          
                          FROM precise_categories 
-                         
-                         
-                         
-                         
-                             
-                        
-                        
-                        
                         """
 
 df = banksDf()
